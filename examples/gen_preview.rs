@@ -6,11 +6,12 @@ mod metrics;
 mod render;
 
 use metrics::SystemMetrics;
-use render::Renderer;
+use render::{FrameBufferPool, Renderer};
 use std::fs;
 
 fn main() {
     let renderer = Renderer::new();
+    let mut pool = FrameBufferPool::new();
     let metrics = SystemMetrics {
         battery_cap: 82,
         battery_status: "放电中".to_string(),
@@ -37,7 +38,7 @@ fn main() {
         rx_mb: 238.4,
         tx_mb: 50.2,
     };
-    let data = renderer.render(&metrics);
+    let data = renderer.render(&mut pool, &metrics);
     fs::write("preview_raw.bin", data).unwrap();
     println!("preview_raw.bin generated successfully");
 }

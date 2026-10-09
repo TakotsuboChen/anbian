@@ -43,6 +43,9 @@ pub struct SystemMetrics {
 pub struct MetricsCollector {
     cpu_percent_cache: Arc<Mutex<f32>>,
     wan_ip_cache: Arc<Mutex<String>>,
+    cached_wifi_ssid: String,
+    cached_lan_ip: String,
+    last_net_check: std::time::Instant,
 }
 
 impl MetricsCollector {
@@ -137,9 +140,16 @@ impl MetricsCollector {
             thread::sleep(Duration::from_secs(600));
         });
 
+        let cached_wifi_ssid = Self::get_wifi_ssid();
+        let cached_lan_ip = Self::get_lan_ip();
+        let last_net_check = std::time::Instant::now();
+
         Self {
             cpu_percent_cache,
             wan_ip_cache,
+            cached_wifi_ssid,
+            cached_lan_ip,
+            last_net_check,
         }
     }
 
@@ -249,11 +259,14 @@ impl MetricsCollector {
             }
         }
 
-        // 5. WiFi SSID
-        m.wifi_ssid = Self::get_wifi_ssid();
-
-        // 6. 局域网 IP
-        m.lan_ip = Self::get_lan_ip();
+        // 5. WiFi SSID 与 6. 局域网 IP (每 5 秒刷新一次，彻底消除每秒 fork ip 进程开销)
+        if self.last_net_check.elapsed() >= Duration::from_secs(5) {
+            self.cached_wifi_ssid = Self::get_wifi_ssid();
+            self.cached_lan_ip = Self::get_lan_ip();
+            self.last_net_check = std::time::Instant::now();
+        }
+        m.wifi_ssid = self.cached_wifi_ssid.clone();
+        m.lan_ip = self.cached_lan_ip.clone();
 
         // 7. 公网 IP (来自缓存)
         if let Ok(lock) = self.wan_ip_cache.lock() {

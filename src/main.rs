@@ -10,7 +10,7 @@ use std::process::Command;
 use framebuffer::{set_screen_state, Framebuffer};
 use input::InputWatcher;
 use metrics::MetricsCollector;
-use render::Renderer;
+use render::{FrameBufferPool, Renderer};
 
 fn ensure_sshd_alive() {
     let output = Command::new("pgrep").arg("sshd").output();
@@ -47,9 +47,10 @@ fn main() {
     // 4. 初始化输入事件监听器 (双击检测状态机)
     let mut watcher = InputWatcher::new();
 
-    // 5. 初始化指标收集器与渲染引擎
+    // 5. 初始化指标收集器、渲染引擎与预分配双缓冲池 (零堆内存碎片)
     let mut collector = MetricsCollector::new();
     let renderer = Renderer::new();
+    let mut pool = FrameBufferPool::new();
 
     // 6. 初始状态: 双击常亮模式 (默认开机点亮)
     let mut is_awake = true;
@@ -57,22 +58,34 @@ fn main() {
 
     // 渲染并呈现首帧画面
     let initial_metrics = collector.collect();
-    let initial_buf = renderer.render(&initial_metrics);
-    fb.write_triple_buffer(&initial_buf);
+    let initial_buf = renderer.render(&mut pool, &initial_metrics);
+    fb.write_triple_buffer(initial_buf);
     println!("首帧画面渲染完成，进入主事件调度循环...");
+
+    let mut frame_count: u64 = 0;
 
     loop {
         if is_awake {
             // 常亮模式: 每秒刷新一次并监听输入 (超时 1000ms)
             let metrics = collector.collect();
-            let buf = renderer.render(&metrics);
-            fb.write_triple_buffer(&buf);
+            let buf = renderer.render(&mut pool, &metrics);
+            fb.write_triple_buffer(buf);
+
+            frame_count += 1;
+            if frame_count % 30 == 0 {
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
 
             let toggled = watcher.poll_for_toggle(1000);
             if toggled {
                 println!("检测到双击或关屏操作: 关闭屏幕并进入深度休眠省电...");
                 set_screen_state(false);
                 is_awake = false;
+                unsafe {
+                    libc::malloc_trim(0);
+                }
             }
         } else {
             // 休眠模式: poll 无限阻塞等待输入，CPU 占用 0.00%
@@ -85,8 +98,8 @@ fn main() {
 
                 // 立即渲染唤醒后的最新数据
                 let metrics = collector.collect();
-                let buf = renderer.render(&metrics);
-                fb.write_triple_buffer(&buf);
+                let buf = renderer.render(&mut pool, &metrics);
+                fb.write_triple_buffer(buf);
             }
         }
     }

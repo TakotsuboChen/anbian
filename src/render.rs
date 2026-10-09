@@ -1,5 +1,7 @@
+use ab_glyph::{Font, FontArc, Point, PxScale, ScaleFont};
 use chrono::Local;
-use fontdue::{Font, FontSettings};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use tiny_skia::{Color, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform};
 
@@ -41,10 +43,37 @@ impl Theme {
     }
 }
 
+pub struct FrameBufferPool {
+    pub content: Pixmap,
+    pub final_buf: Vec<u8>,
+}
+
+impl FrameBufferPool {
+    pub fn new() -> Self {
+        let content = Pixmap::new(SCREEN_WIDTH, SCREEN_HEIGHT).unwrap();
+        let final_buf = vec![0u8; (LINE_STRIDE * SCREEN_HEIGHT) as usize];
+        unsafe {
+            libc::malloc_trim(0);
+        }
+        Self { content, final_buf }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct CachedGlyph {
+    pub advance_width: f32,
+    pub width: usize,
+    pub height: usize,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub bitmap: Vec<u8>,
+}
+
 pub struct Renderer {
     pub theme: Theme,
-    font_cn: Option<Font>,
-    font_en: Option<Font>,
+    font_cn: Option<FontArc>,
+    font_en: Option<FontArc>,
+    glyph_cache: RefCell<HashMap<(char, u32), CachedGlyph>>,
 }
 
 impl Renderer {
@@ -53,13 +82,70 @@ impl Renderer {
         let font_en_data =
             fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf").ok();
 
-        let font_cn = font_cn_data.and_then(|d| Font::from_bytes(d, FontSettings::default()).ok());
-        let font_en = font_en_data.and_then(|d| Font::from_bytes(d, FontSettings::default()).ok());
+        let font_cn = font_cn_data.and_then(|d| FontArc::try_from_vec(d).ok());
+        let font_en = font_en_data.and_then(|d| FontArc::try_from_vec(d).ok());
+
+        unsafe {
+            libc::malloc_trim(0);
+        }
 
         Self {
             theme: Theme::new(),
             font_cn,
             font_en,
+            glyph_cache: RefCell::new(HashMap::with_capacity(128)),
+        }
+    }
+
+    fn get_glyph(&self, ch: char, px_size: f32) -> CachedGlyph {
+        let scale = PxScale::from(px_size);
+        let (font, glyph_id) = if let Some(ref fe) = self.font_en {
+            let id = fe.glyph_id(ch);
+            if id.0 != 0 {
+                (fe, id)
+            } else if let Some(ref fc) = self.font_cn {
+                (fc, fc.glyph_id(ch))
+            } else {
+                (fe, id)
+            }
+        } else if let Some(ref fc) = self.font_cn {
+            (fc, fc.glyph_id(ch))
+        } else {
+            return CachedGlyph::default();
+        };
+
+        let scaled_font = font.as_scaled(scale);
+        let advance_width = scaled_font.h_advance(glyph_id);
+        let glyph = glyph_id.with_scale_and_position(scale, Point { x: 0.0, y: 0.0 });
+
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            let width = bounds.width().ceil() as usize;
+            let height = bounds.height().ceil() as usize;
+            let mut bitmap = vec![0u8; width * height];
+            outlined.draw(|x, y, c| {
+                let idx = y as usize * width + x as usize;
+                if idx < bitmap.len() {
+                    bitmap[idx] = (c * 255.0).min(255.0) as u8;
+                }
+            });
+            CachedGlyph {
+                advance_width,
+                width,
+                height,
+                offset_x: bounds.min.x,
+                offset_y: bounds.min.y,
+                bitmap,
+            }
+        } else {
+            CachedGlyph {
+                advance_width,
+                width: 0,
+                height: 0,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                bitmap: Vec::new(),
+            }
         }
     }
 
@@ -73,27 +159,18 @@ impl Renderer {
         px_size: f32,
         color: Color,
     ) -> f32 {
+        let size_key = px_size as u32;
+        let mut cache = self.glyph_cache.borrow_mut();
+
         for ch in text.chars() {
-            // 选择可用字体
-            let font = if let Some(ref fe) = self.font_en {
-                if fe.lookup_glyph_index(ch) != 0 {
-                    fe
-                } else if let Some(ref fc) = self.font_cn {
-                    fc
-                } else {
-                    fe
-                }
-            } else if let Some(ref fc) = self.font_cn {
-                fc
-            } else {
-                continue;
-            };
+            let cached = cache
+                .entry((ch, size_key))
+                .or_insert_with(|| self.get_glyph(ch, px_size));
 
-            let (metrics, bitmap) = font.rasterize(ch, px_size);
-            let gx = (start_x + metrics.xmin as f32).round() as i32;
-            let gy = (base_y - metrics.height as f32 - metrics.ymin as f32).round() as i32;
+            if !cached.bitmap.is_empty() && cached.width > 0 && cached.height > 0 {
+                let gx = (start_x + cached.offset_x).round() as i32;
+                let gy = (base_y + cached.offset_y).round() as i32;
 
-            if !bitmap.is_empty() && metrics.width > 0 && metrics.height > 0 {
                 let r = (color.red() * 255.0) as u32;
                 let g = (color.green() * 255.0) as u32;
                 let b = (color.blue() * 255.0) as u32;
@@ -102,18 +179,18 @@ impl Renderer {
                 let pw = pixmap.width() as i32;
                 let ph = pixmap.height() as i32;
 
-                for row in 0..metrics.height {
+                for row in 0..cached.height {
                     let py = gy + row as i32;
                     if py < 0 || py >= ph {
                         continue;
                     }
-                    for col in 0..metrics.width {
+                    for col in 0..cached.width {
                         let px = gx + col as i32;
                         if px < 0 || px >= pw {
                             continue;
                         }
 
-                        let alpha_val = bitmap[row * metrics.width + col];
+                        let alpha_val = cached.bitmap[row * cached.width + col];
                         if alpha_val == 0 {
                             continue;
                         }
@@ -138,7 +215,7 @@ impl Renderer {
                 }
             }
 
-            start_x += metrics.advance_width;
+            start_x += cached.advance_width;
         }
 
         start_x
@@ -166,24 +243,15 @@ impl Renderer {
     }
 
     pub fn measure_text(&self, text: &str, px_size: f32) -> f32 {
+        let size_key = px_size as u32;
         let mut total_w = 0.0;
-        for ch in text.chars() {
-            let font = if let Some(ref fe) = self.font_en {
-                if fe.lookup_glyph_index(ch) != 0 {
-                    fe
-                } else if let Some(ref fc) = self.font_cn {
-                    fc
-                } else {
-                    fe
-                }
-            } else if let Some(ref fc) = self.font_cn {
-                fc
-            } else {
-                continue;
-            };
+        let mut cache = self.glyph_cache.borrow_mut();
 
-            let metrics = font.metrics(ch, px_size);
-            total_w += metrics.advance_width;
+        for ch in text.chars() {
+            let cached = cache
+                .entry((ch, size_key))
+                .or_insert_with(|| self.get_glyph(ch, px_size));
+            total_w += cached.advance_width;
         }
         total_w
     }
@@ -319,10 +387,10 @@ impl Renderer {
         );
     }
 
-    /// 全屏渲染函数
-    pub fn render(&self, metrics: &SystemMetrics) -> Vec<u8> {
-        let mut content = Pixmap::new(SCREEN_WIDTH, SCREEN_HEIGHT).unwrap();
-        content.fill(self.theme.bg);
+    /// 全屏渲染函数 (零堆内存分配)
+    pub fn render<'a>(&self, pool: &'a mut FrameBufferPool, metrics: &SystemMetrics) -> &'a [u8] {
+        pool.content.fill(self.theme.bg);
+        let content = &mut pool.content;
 
         let margin = 44.0;
         let col_gap = 24.0;
@@ -344,7 +412,7 @@ impl Renderer {
 
         // 超大时钟数字 (字号提升至 102.0 pt)
         self.draw_text(
-            &mut content,
+            content,
             &clock_str,
             margin,
             125.0,
@@ -355,7 +423,7 @@ impl Renderer {
         // 日期与运行时间 (字号提升至 30.0 pt)
         let sub_info = format!("{} {}   ·   系统运行 {}", date_str, weekday_str, metrics.uptime_str);
         self.draw_text(
-            &mut content,
+            content,
             &sub_info,
             margin,
             180.0,
@@ -403,7 +471,7 @@ impl Renderer {
 
         // 3. 超大字号“运行中” (36pt)
         self.draw_text(
-            &mut content,
+            content,
             "运行中",
             tag_x + 32.0,
             90.0,
@@ -425,116 +493,112 @@ impl Renderer {
 
         // ----- 卡片 1 (左上): 处理器 -----
         let col1_x = margin;
-        self.draw_card_box(&mut content, col1_x, row1_y, card_w, card_h, "处理器", self.theme.orange);
+        self.draw_card_box(content, col1_x, row1_y, card_w, card_h, "处理器", self.theme.orange);
         let ring1_cx = col1_x + (card_w / 2.0);
         let ring1_cy = row1_y + 195.0;
         let cpu_color = if metrics.cpu_percent > 85.0 { self.theme.red } else { self.theme.orange };
-        self.draw_ring_gauge(&mut content, ring1_cx, ring1_cy, ring_radius, ring_stroke, metrics.cpu_percent, cpu_color);
+        self.draw_ring_gauge(content, ring1_cx, ring1_cy, ring_radius, ring_stroke, metrics.cpu_percent, cpu_color);
         // 圆心数字 (56pt，在半径 102 的超大圆环中空间充裕，绝不贴边)
         let cpu_str = format!("{:.0}%", metrics.cpu_percent);
-        self.draw_text_centered(&mut content, &cpu_str, ring1_cx, ring1_cy + 20.0, 56.0, self.theme.text_primary);
+        self.draw_text_centered(content, &cpu_str, ring1_cx, ring1_cy + 20.0, 56.0, self.theme.text_primary);
         // 下方详细指标
-        self.draw_text_centered(&mut content, &format!("核心温度: {:.1} ℃", metrics.cpu_temp), ring1_cx, row1_y + 380.0, 28.0, self.theme.orange);
-        self.draw_text_centered(&mut content, &format!("当前主频: {}", metrics.cpu_load), ring1_cx, row1_y + 430.0, 26.0, self.theme.text_secondary);
+        self.draw_text_centered(content, &format!("核心温度: {:.1} ℃", metrics.cpu_temp), ring1_cx, row1_y + 380.0, 28.0, self.theme.orange);
+        self.draw_text_centered(content, &format!("当前主频: {}", metrics.cpu_load), ring1_cx, row1_y + 430.0, 26.0, self.theme.text_secondary);
 
         // ----- 卡片 2 (右上): 运行内存 -----
         let col2_x = margin + card_w + col_gap;
-        self.draw_card_box(&mut content, col2_x, row1_y, card_w, card_h, "运行内存", self.theme.purple);
+        self.draw_card_box(content, col2_x, row1_y, card_w, card_h, "运行内存", self.theme.purple);
         let ring2_cx = col2_x + (card_w / 2.0);
         let ring2_cy = row1_y + 195.0;
-        self.draw_ring_gauge(&mut content, ring2_cx, ring2_cy, ring_radius, ring_stroke, metrics.mem_percent, self.theme.purple);
+        self.draw_ring_gauge(content, ring2_cx, ring2_cy, ring_radius, ring_stroke, metrics.mem_percent, self.theme.purple);
         // 圆心数字
         let mem_str = format!("{:.0}%", metrics.mem_percent);
-        self.draw_text_centered(&mut content, &mem_str, ring2_cx, ring2_cy + 20.0, 56.0, self.theme.text_primary);
+        self.draw_text_centered(content, &mem_str, ring2_cx, ring2_cy + 20.0, 56.0, self.theme.text_primary);
         // 下方详细指标
-        self.draw_text_centered(&mut content, &format!("已用: {} MB / {} MB", metrics.mem_used_mb, metrics.mem_total_mb), ring2_cx, row1_y + 380.0, 28.0, self.theme.text_primary);
-        self.draw_text_centered(&mut content, &format!("Swap: {} MB ({:.0}%)", metrics.swap_used_mb, metrics.swap_percent), ring2_cx, row1_y + 430.0, 26.0, self.theme.text_secondary);
+        self.draw_text_centered(content, &format!("已用: {} MB / {} MB", metrics.mem_used_mb, metrics.mem_total_mb), ring2_cx, row1_y + 380.0, 28.0, self.theme.text_primary);
+        self.draw_text_centered(content, &format!("Swap: {} MB ({:.0}%)", metrics.swap_used_mb, metrics.swap_percent), ring2_cx, row1_y + 430.0, 26.0, self.theme.text_secondary);
 
         // ----- 第二行方块 (y: row2_y) -----
         let row2_y = row1_y + card_h + 30.0; // 250 + 490 + 30 = 770.0
 
         // ----- 卡片 3 (左下): 电池与功耗 -----
-        self.draw_card_box(&mut content, col1_x, row2_y, card_w, card_h, "电池与功耗", self.theme.green);
+        self.draw_card_box(content, col1_x, row2_y, card_w, card_h, "电池与功耗", self.theme.green);
         let ring3_cx = col1_x + (card_w / 2.0);
         let ring3_cy = row2_y + 195.0;
         let bat_color = if metrics.battery_cap <= 20 { self.theme.red } else { self.theme.green };
-        self.draw_ring_gauge(&mut content, ring3_cx, ring3_cy, ring_radius, ring_stroke, metrics.battery_cap as f32, bat_color);
+        self.draw_ring_gauge(content, ring3_cx, ring3_cy, ring_radius, ring_stroke, metrics.battery_cap as f32, bat_color);
         // 圆心数字
         let bat_str = format!("{}%", metrics.battery_cap);
-        self.draw_text_centered(&mut content, &bat_str, ring3_cx, ring3_cy + 20.0, 56.0, self.theme.text_primary);
+        self.draw_text_centered(content, &bat_str, ring3_cx, ring3_cy + 20.0, 56.0, self.theme.text_primary);
         // 下方指标 (只显示瓦时 Wh 与实时功率 W)
-        self.draw_text_centered(&mut content, &format!("剩余电量: {:.1} Wh", metrics.battery_wh), ring3_cx, row2_y + 380.0, 28.0, self.theme.green);
+        self.draw_text_centered(content, &format!("剩余电量: {:.1} Wh", metrics.battery_wh), ring3_cx, row2_y + 380.0, 28.0, self.theme.green);
         let pwr_str = format!("{} · 功率 {:.2} W", metrics.battery_status, metrics.battery_power_w);
-        self.draw_text_centered(&mut content, &pwr_str, ring3_cx, row2_y + 430.0, 26.0, self.theme.text_secondary);
+        self.draw_text_centered(content, &pwr_str, ring3_cx, row2_y + 430.0, 26.0, self.theme.text_secondary);
 
         // ----- 卡片 4 (右下): 存储空间 -----
-        self.draw_card_box(&mut content, col2_x, row2_y, card_w, card_h, "存储空间", self.theme.blue);
+        self.draw_card_box(content, col2_x, row2_y, card_w, card_h, "存储空间", self.theme.blue);
         let ring4_cx = col2_x + (card_w / 2.0);
         let ring4_cy = row2_y + 195.0;
-        self.draw_ring_gauge(&mut content, ring4_cx, ring4_cy, ring_radius, ring_stroke, metrics.disk_percent, self.theme.blue);
+        self.draw_ring_gauge(content, ring4_cx, ring4_cy, ring_radius, ring_stroke, metrics.disk_percent, self.theme.blue);
         // 圆心数字
         let disk_str = format!("{:.0}%", metrics.disk_percent);
-        self.draw_text_centered(&mut content, &disk_str, ring4_cx, ring4_cy + 20.0, 56.0, self.theme.text_primary);
+        self.draw_text_centered(content, &disk_str, ring4_cx, ring4_cy + 20.0, 56.0, self.theme.text_primary);
         // 下方指标
-        self.draw_text_centered(&mut content, &format!("已用: {:.1} GB / {:.1} GB", metrics.disk_used_gb, metrics.disk_total_gb), ring4_cx, row2_y + 380.0, 28.0, self.theme.text_primary);
-        self.draw_text_centered(&mut content, &format!("使用率: {:.1}%", metrics.disk_percent), ring4_cx, row2_y + 430.0, 26.0, self.theme.text_secondary);
+        self.draw_text_centered(content, &format!("已用: {:.1} GB / {:.1} GB", metrics.disk_used_gb, metrics.disk_total_gb), ring4_cx, row2_y + 380.0, 28.0, self.theme.text_primary);
+        self.draw_text_centered(content, &format!("使用率: {:.1}%", metrics.disk_percent), ring4_cx, row2_y + 430.0, 26.0, self.theme.text_secondary);
 
         // ================= 3. 网络连接卡片 (去除双语英文与括号) =================
         let net_y = row2_y + card_h + 30.0; // 770 + 490 + 30 = 1290.0
         let net_w = SCREEN_WIDTH as f32 - (margin * 2.0);
         let net_h = 550.0;
-        self.draw_card_box(&mut content, margin, net_y, net_w, net_h, "网络连接", self.theme.green);
+        self.draw_card_box(content, margin, net_y, net_w, net_h, "网络连接", self.theme.green);
 
         let net_left = margin + 44.0;
         let line_gap = 105.0;
 
         // Line 1: WiFi 名称
-        self.draw_text(&mut content, "WiFi 名称:", net_left, net_y + 120.0, 30.0, self.theme.text_secondary);
-        self.draw_text(&mut content, &metrics.wifi_ssid, net_left + 220.0, net_y + 120.0, 34.0, self.theme.green);
+        self.draw_text(content, "WiFi 名称:", net_left, net_y + 120.0, 30.0, self.theme.text_secondary);
+        self.draw_text(content, &metrics.wifi_ssid, net_left + 220.0, net_y + 120.0, 34.0, self.theme.green);
 
         // Line 2: 局域网 IP
-        self.draw_text(&mut content, "局域网 IP:", net_left, net_y + 120.0 + line_gap, 30.0, self.theme.text_secondary);
-        self.draw_text(&mut content, &metrics.lan_ip, net_left + 220.0, net_y + 120.0 + line_gap, 34.0, self.theme.blue);
+        self.draw_text(content, "局域网 IP:", net_left, net_y + 120.0 + line_gap, 30.0, self.theme.text_secondary);
+        self.draw_text(content, &metrics.lan_ip, net_left + 220.0, net_y + 120.0 + line_gap, 34.0, self.theme.blue);
 
         // Line 3: 公网 IP
-        self.draw_text(&mut content, "公网 IP:", net_left, net_y + 120.0 + (line_gap * 2.0), 30.0, self.theme.text_secondary);
-        self.draw_text(&mut content, &metrics.wan_ip, net_left + 220.0, net_y + 120.0 + (line_gap * 2.0), 34.0, self.theme.orange);
+        self.draw_text(content, "公网 IP:", net_left, net_y + 120.0 + (line_gap * 2.0), 30.0, self.theme.text_secondary);
+        self.draw_text(content, &metrics.wan_ip, net_left + 220.0, net_y + 120.0 + (line_gap * 2.0), 34.0, self.theme.orange);
 
         // Line 4: 累计流量
-        self.draw_text(&mut content, "累计流量:", net_left, net_y + 120.0 + (line_gap * 3.0), 30.0, self.theme.text_secondary);
+        self.draw_text(content, "累计流量:", net_left, net_y + 120.0 + (line_gap * 3.0), 30.0, self.theme.text_secondary);
         let traffic_str = format!("↓ 接收 {:.1} MB     ↑ 发送 {:.1} MB", metrics.rx_mb, metrics.tx_mb);
-        self.draw_text(&mut content, &traffic_str, net_left + 220.0, net_y + 120.0 + (line_gap * 3.0), 32.0, self.theme.text_primary);
+        self.draw_text(content, &traffic_str, net_left + 220.0, net_y + 120.0 + (line_gap * 3.0), 32.0, self.theme.text_primary);
 
         // ================= 4. 彻底删除双击文案方块，底部纯净留白 =================
 
-        // ================= 5. 旋转 180 度并适配硬件步幅 =================
-        let mut rotated = Pixmap::new(SCREEN_WIDTH, SCREEN_HEIGHT).unwrap();
-        let src_data = content.data();
-        let dst_data = rotated.data_mut();
-        let total_pixels = (SCREEN_WIDTH * SCREEN_HEIGHT) as usize;
+        // ================= 5. 单通道 180 度旋转并对齐硬件步幅写入预分配缓冲 (0 堆内存分配) =================
+        let src_data = pool.content.data();
+        let dst_data = &mut pool.final_buf;
+        let sw = SCREEN_WIDTH as usize;
+        let sh = SCREEN_HEIGHT as usize;
+        let stride = LINE_STRIDE as usize;
 
-        for i in 0..total_pixels {
-            let inv_i = total_pixels - 1 - i;
-            let src_idx = i * 4;
-            let dst_idx = inv_i * 4;
-            dst_data[dst_idx] = src_data[src_idx];
-            dst_data[dst_idx + 1] = src_data[src_idx + 1];
-            dst_data[dst_idx + 2] = src_data[src_idx + 2];
-            dst_data[dst_idx + 3] = src_data[src_idx + 3];
+        for row in 0..sh {
+            let src_row = (sh - 1) - row;
+            let src_row_offset = src_row * sw * 4;
+            let dst_row_offset = row * stride;
+
+            for col in 0..sw {
+                let src_col = (sw - 1) - col;
+                let src_idx = src_row_offset + src_col * 4;
+                let dst_idx = dst_row_offset + col * 4;
+
+                dst_data[dst_idx] = src_data[src_idx];
+                dst_data[dst_idx + 1] = src_data[src_idx + 1];
+                dst_data[dst_idx + 2] = src_data[src_idx + 2];
+                dst_data[dst_idx + 3] = src_data[src_idx + 3];
+            }
         }
 
-        let mut final_buf = vec![0u8; (LINE_STRIDE * SCREEN_HEIGHT) as usize];
-        let rot_bytes = rotated.data();
-        let src_row_bytes = (SCREEN_WIDTH * 4) as usize;
-        let dst_row_bytes = LINE_STRIDE as usize;
-
-        for row in 0..SCREEN_HEIGHT as usize {
-            let src_offset = row * src_row_bytes;
-            let dst_offset = row * dst_row_bytes;
-            final_buf[dst_offset..dst_offset + src_row_bytes]
-                .copy_from_slice(&rot_bytes[src_offset..src_offset + src_row_bytes]);
-        }
-
-        final_buf
+        &pool.final_buf
     }
 }
