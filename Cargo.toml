@@ -1,0 +1,23 @@
+[package]
+name = "anbian"
+version = "0.1.0"
+edition = "2021"
+authors = ["TakotsuboChen <94740441+TakotsuboChen@users.noreply.github.com>"]
+description = "专为旧手机与嵌入式 Linux 打造的极速纯 Rust Framebuffer 硬件仪表盘与边缘监控终端"
+license = "MIT"
+repository = "https://github.com/TakotsuboChen/anbian"
+keywords = ["framebuffer", "dashboard", "embedded", "system-monitor", "rust"]
+categories = ["command-line-utilities", "embedded"]
+
+[dependencies]
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+fontdue = { version = "0.9.4", default-features = false, features = ["simd"] }
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
